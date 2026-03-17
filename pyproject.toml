@@ -16,3 +16,6 @@ dependencies = [
 
 [project.scripts]
 outlook-mcp-server = "server:mcp.run"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["server.py"]
