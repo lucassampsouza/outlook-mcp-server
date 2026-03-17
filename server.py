@@ -773,15 +773,12 @@ def search_events(
 def main() -> None:
     import sys
     try:
-        # fastmcp 2.x stores tools in _tools dict
-        tools = list(mcp._tools.keys())
-        print(f"[outlook-mcp] registered tools ({len(tools)}): {tools}", file=sys.stderr)
-    except AttributeError:
-        try:
-            attrs = [a for a in dir(mcp) if "tool" in a.lower()]
-            print(f"[outlook-mcp] tool-related attrs: {attrs}", file=sys.stderr)
-        except Exception as e2:
-            print(f"[outlook-mcp] debug failed: {e2}", file=sys.stderr)
+        import asyncio
+        tools = asyncio.run(mcp.list_tools())
+        names = [t.name for t in tools]
+        print(f"[outlook-mcp] registered tools ({len(names)}): {names}", file=sys.stderr)
+    except Exception as e:
+        print(f"[outlook-mcp] could not list tools: {e}", file=sys.stderr)
     mcp.run()
 
 
