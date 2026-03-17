@@ -2,17 +2,24 @@
 Outlook Calendar MCP Server
 Exposes Microsoft Graph API calendar operations as MCP tools.
 
-Authentication uses the Client Credentials (app-only) flow.
+Supports two authentication modes:
 
-Single-account (default) environment variables:
+1. Application permissions (Client Credentials flow) — requires admin consent:
     AZURE_TENANT_ID     - Your Azure AD tenant ID
     AZURE_CLIENT_ID     - Application (client) ID from Azure App Registration
     AZURE_CLIENT_SECRET - Client secret from Azure App Registration
 
-Multi-account support (named profiles):
+2. Delegated permissions (Refresh Token flow) — no admin consent required:
+    AZURE_TENANT_ID      - Your Azure AD tenant ID
+    AZURE_CLIENT_ID      - Application (client) ID from Azure App Registration
+    AZURE_REFRESH_TOKEN  - Refresh token obtained via setup.py Device Code flow
+
+Multi-account support (named profiles) — same two modes per account:
     ACCOUNT_{NAME}_TENANT_ID     - Tenant ID for the named account
     ACCOUNT_{NAME}_CLIENT_ID     - Client ID for the named account
-    ACCOUNT_{NAME}_CLIENT_SECRET - Client secret for the named account
+    ACCOUNT_{NAME}_CLIENT_SECRET - Client secret (application auth)
+      OR
+    ACCOUNT_{NAME}_REFRESH_TOKEN - Refresh token (delegated auth)
 
     Example names: ACCOUNT_WORK_TENANT_ID, ACCOUNT_PERSONAL_TENANT_ID
     Use account="work" or account="personal" in any tool call.
@@ -20,19 +27,36 @@ Multi-account support (named profiles):
 See SETUP.md for detailed setup instructions.
 """
 
+import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env", override=True)
 
 mcp = FastMCP("Outlook Calendar MCP Server")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+
+# Explicit delegated scopes requested during Device Code flow.
+# Using .default fails in multi-tenant scenarios where the app hasn't been
+# pre-authorized in the user's tenant — explicit scopes work with any tenant
+# and drive a clear user consent screen.
+DELEGATED_SCOPES = (
+    "https://graph.microsoft.com/Calendars.Read "
+    "https://graph.microsoft.com/Calendars.Read.Shared "
+    "https://graph.microsoft.com/Calendars.ReadBasic "
+    "https://graph.microsoft.com/Calendars.ReadWrite "
+    "https://graph.microsoft.com/Calendars.ReadWrite.Shared "
+    "https://graph.microsoft.com/User.Read "
+    "offline_access"
+)
 
 # ---------------------------------------------------------------------------
 # Multi-account credential loading
@@ -52,27 +76,59 @@ def _load_accounts() -> dict[str, dict]:
     tenant = os.environ.get("AZURE_TENANT_ID")
     client = os.environ.get("AZURE_CLIENT_ID")
     secret = os.environ.get("AZURE_CLIENT_SECRET")
-    if tenant and client and secret:
-        accounts["default"] = {
-            "tenant_id": tenant,
-            "client_id": client,
-            "client_secret": secret,
-        }
+    refresh_token = os.environ.get("AZURE_REFRESH_TOKEN")
+    if tenant and client:
+        if secret:
+            accounts["default"] = {
+                "tenant_id": tenant,
+                "client_id": client,
+                "client_secret": secret,
+                "auth_type": "application",
+            }
+        elif refresh_token:
+            accounts["default"] = {
+                "tenant_id": tenant,
+                "client_id": client,
+                "refresh_token": refresh_token,
+                "auth_type": "delegated",
+            }
 
-    # Named accounts: ACCOUNT_{NAME}_TENANT_ID
-    for key, value in os.environ.items():
-        if key.startswith("ACCOUNT_") and key.endswith("_TENANT_ID"):
-            # Extract the name part between ACCOUNT_ and _TENANT_ID
-            name = key[len("ACCOUNT_"):-len("_TENANT_ID")].lower()
-            prefix = f"ACCOUNT_{key[len('ACCOUNT_'):-len('_TENANT_ID')]}_"
-            client_id = os.environ.get(f"{prefix}CLIENT_ID")
-            client_secret = os.environ.get(f"{prefix}CLIENT_SECRET")
-            if client_id and client_secret:
-                accounts[name] = {
-                    "tenant_id": value,
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                }
+    # Named accounts.
+    #
+    # A named account is detected by either ACCOUNT_{NAME}_TENANT_ID or
+    # ACCOUNT_{NAME}_REFRESH_TOKEN / ACCOUNT_{NAME}_CLIENT_SECRET being present.
+    # CLIENT_ID and TENANT_ID fall back to the default AZURE_* values when not
+    # explicitly set, so multiple users sharing the same app registration only
+    # need to supply their own REFRESH_TOKEN (or CLIENT_SECRET).
+    named: dict[str, str] = {}  # raw_name -> prefix
+    for key in os.environ:
+        for suffix in ("_TENANT_ID", "_CLIENT_ID", "_CLIENT_SECRET", "_REFRESH_TOKEN"):
+            if key.startswith("ACCOUNT_") and key.endswith(suffix):
+                raw = key[len("ACCOUNT_"):-len(suffix)]
+                named[raw] = f"ACCOUNT_{raw}_"
+
+    for raw, prefix in named.items():
+        name = raw.lower()
+        acc_tenant = os.environ.get(f"{prefix}TENANT_ID") or tenant
+        acc_client = os.environ.get(f"{prefix}CLIENT_ID") or client
+        if not acc_tenant or not acc_client:
+            continue
+        client_secret = os.environ.get(f"{prefix}CLIENT_SECRET")
+        refresh_tok = os.environ.get(f"{prefix}REFRESH_TOKEN")
+        if client_secret:
+            accounts[name] = {
+                "tenant_id": acc_tenant,
+                "client_id": acc_client,
+                "client_secret": client_secret,
+                "auth_type": "application",
+            }
+        elif refresh_tok:
+            accounts[name] = {
+                "tenant_id": acc_tenant,
+                "client_id": acc_client,
+                "refresh_token": refresh_tok,
+                "auth_type": "delegated",
+            }
 
     return accounts
 
@@ -90,15 +146,22 @@ def _get_creds(account: str) -> dict:
         raise ValueError(
             f"Unknown account '{account}'. "
             f"Configured accounts: {configured}. "
-            "Check your .env file — add ACCOUNT_{NAME}_TENANT_ID / "
-            "ACCOUNT_{NAME}_CLIENT_ID / ACCOUNT_{NAME}_CLIENT_SECRET "
-            "for each additional account."
+            "Check your .env file — for application auth add "
+            "ACCOUNT_{NAME}_TENANT_ID / ACCOUNT_{NAME}_CLIENT_ID / ACCOUNT_{NAME}_CLIENT_SECRET; "
+            "for delegated auth add "
+            "ACCOUNT_{NAME}_TENANT_ID / ACCOUNT_{NAME}_CLIENT_ID / ACCOUNT_{NAME}_REFRESH_TOKEN. "
+            "Run setup.py to generate credentials."
         )
     return _accounts[account]
 
 
 def get_access_token(account: str = "default") -> str:
-    """Obtain an access token for the given account, with basic caching."""
+    """Obtain an access token for the given account, with basic caching.
+
+    Supports two authentication flows determined by account configuration:
+    - Application (client_credentials): uses client_secret, requires admin consent.
+    - Delegated (refresh_token): uses a stored refresh token, no admin consent needed.
+    """
     now = datetime.now(timezone.utc)
     cached = _token_cache.get(account)
     if cached and cached["expires_at"] > now:
@@ -108,18 +171,33 @@ def get_access_token(account: str = "default") -> str:
     token_url = (
         f"https://login.microsoftonline.com/{creds['tenant_id']}/oauth2/v2.0/token"
     )
-    response = httpx.post(
-        token_url,
-        data={
+
+    if creds.get("auth_type") == "delegated":
+        token_data = {
+            "grant_type": "refresh_token",
+            "client_id": creds["client_id"],
+            "refresh_token": creds["refresh_token"],
+            "scope": DELEGATED_SCOPES,
+        }
+    else:
+        token_data = {
             "grant_type": "client_credentials",
             "client_id": creds["client_id"],
             "client_secret": creds["client_secret"],
             "scope": "https://graph.microsoft.com/.default",
-        },
-        timeout=30,
-    )
+        }
+
+    response = httpx.post(token_url, data=token_data, timeout=30)
     response.raise_for_status()
     data = response.json()
+
+    # Microsoft rotates refresh tokens on every use — the old one is immediately
+    # revoked.  Update both in-memory and .env so a process restart doesn't
+    # leave a stale (revoked) token on disk.
+    if "refresh_token" in data and creds.get("auth_type") == "delegated":
+        new_rt = data["refresh_token"]
+        _accounts[account]["refresh_token"] = new_rt
+        _save_account_to_env(account, creds["tenant_id"], creds["client_id"], new_rt)
 
     expires_in = int(data.get("expires_in", 3600))
     _token_cache[account] = {
@@ -150,6 +228,89 @@ def _graph(method: str, path: str, account: str = "default", **kwargs) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Device Code auth helpers
+# ---------------------------------------------------------------------------
+
+# In-memory cache (same process). Cross-process state is stored on disk.
+_pending_device_flows: dict[str, dict] = {}
+
+_FLOWS_FILE = Path(__file__).parent / ".pending_flows.json"
+
+DEVICE_CODE_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/devicecode"
+TOKEN_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+
+def _flows_load() -> dict:
+    """Read all pending flows from disk."""
+    if _FLOWS_FILE.exists():
+        try:
+            return json.loads(_FLOWS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _flows_save(flows: dict) -> None:
+    """Persist all pending flows to disk."""
+    _FLOWS_FILE.write_text(json.dumps(flows, indent=2))
+
+
+def _flows_delete(account_name: str) -> None:
+    """Remove a single flow from disk."""
+    flows = _flows_load()
+    flows.pop(account_name, None)
+    if flows:
+        _flows_save(flows)
+    elif _FLOWS_FILE.exists():
+        _FLOWS_FILE.unlink()
+
+
+def _save_account_to_env(
+    account_name: str, tenant_id: str, client_id: str, refresh_token: str
+) -> None:
+    """Persist delegated credentials to .env, replacing any previous entry."""
+    env_file = Path(__file__).parent / ".env"
+
+    if account_name == "default":
+        keys_to_remove = {
+            "AZURE_TENANT_ID", "AZURE_CLIENT_ID",
+            "AZURE_CLIENT_SECRET", "AZURE_REFRESH_TOKEN",
+        }
+        new_lines = [
+            f'AZURE_TENANT_ID="{tenant_id}"',
+            f'AZURE_CLIENT_ID="{client_id}"',
+            f'AZURE_REFRESH_TOKEN="{refresh_token}"',
+        ]
+    else:
+        prefix = f"ACCOUNT_{account_name.upper()}_"
+        keys_to_remove = {
+            f"{prefix}TENANT_ID", f"{prefix}CLIENT_ID",
+            f"{prefix}CLIENT_SECRET", f"{prefix}REFRESH_TOKEN",
+        }
+        new_lines = [
+            f'{prefix}TENANT_ID="{tenant_id}"',
+            f'{prefix}CLIENT_ID="{client_id}"',
+            f'{prefix}REFRESH_TOKEN="{refresh_token}"',
+        ]
+
+    existing: list[str] = []
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            key = line.split("=")[0].strip() if "=" in line else ""
+            if key not in keys_to_remove:
+                existing.append(line)
+
+    env_file.write_text("\n".join(existing + new_lines) + "\n")
+
+
+def _reload_accounts() -> None:
+    """Re-read .env and refresh the in-memory accounts dict."""
+    load_dotenv(Path(__file__).parent / ".env", override=True)
+    _accounts.clear()
+    _accounts.update(_load_accounts())
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -165,6 +326,204 @@ def list_accounts() -> dict:
         "note": (
             "Use one of these names as the `account` parameter in any tool. "
             "Omit `account` (or use 'default') to use the primary account."
+        ),
+    }
+
+
+@mcp.tool()
+def start_device_code_auth(
+    account_name: str = "default",
+    tenant_id: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> dict:
+    """Begin a Device Code authentication flow to add a delegated account.
+
+    Use this to authenticate a Microsoft user without needing admin consent or
+    a client secret.  Returns a short code and URL the user must visit to sign
+    in.  After sign-in, call complete_device_code_auth with the same
+    account_name to finish and persist the credentials.
+
+    Args:
+        account_name: Name to assign to this account (e.g. 'alice', 'work').
+            Use 'default' to replace the primary account.  Defaults to
+            'default'.
+        tenant_id: Azure AD tenant ID to restrict authentication to a specific
+            tenant.  Defaults to 'common', which accepts users from any Azure
+            AD tenant (requires the app registration to be multi-tenant).
+        client_id: Azure Application (client) ID.  Falls back to
+            AZURE_CLIENT_ID when omitted.
+    """
+    # 'common' allows users from any tenant; a specific tenant_id restricts
+    # authentication to that tenant only.
+    resolved_tenant = tenant_id or "common"
+    resolved_client = client_id or os.environ.get("AZURE_CLIENT_ID")
+
+    if not resolved_tenant or not resolved_client:
+        return {
+            "error": (
+                "tenant_id and client_id are required. "
+                "Pass them as arguments or set AZURE_TENANT_ID / AZURE_CLIENT_ID in .env."
+            )
+        }
+
+    response = httpx.post(
+        DEVICE_CODE_URL.format(tenant_id=resolved_tenant),
+        data={
+            "client_id": resolved_client,
+            "scope": DELEGATED_SCOPES,
+        },
+        timeout=30,
+    )
+    if not response.is_success:
+        body = response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
+        return {
+            "error": f"HTTP {response.status_code}",
+            "microsoft_error": body,
+            "hint": (
+                "Common causes: (1) wrong tenant_id or client_id; "
+                "(2) 'Allow public client flows' not enabled in the Azure App Registration "
+                "(Portal → App Registration → Authentication → Advanced settings); "
+                "(3) app does not exist in this tenant."
+            ),
+        }
+    flow = response.json()
+
+    flow_state = {
+        "tenant_id": resolved_tenant,
+        "client_id": resolved_client,
+        "device_code": flow["device_code"],
+        "interval": int(flow.get("interval", 5)),
+        "expires_in": int(flow.get("expires_in", 900)),
+    }
+    # Persist to disk so complete_device_code_auth works across processes/sessions.
+    _pending_device_flows[account_name] = flow_state
+    flows = _flows_load()
+    flows[account_name] = flow_state
+    _flows_save(flows)
+
+    return {
+        "user_code": flow["user_code"],
+        "verification_uri": flow["verification_uri"],
+        "message": flow.get("message"),
+        "next_step": (
+            f"After signing in, call complete_device_code_auth "
+            f"with account_name='{account_name}'."
+        ),
+    }
+
+
+@mcp.tool()
+def get_admin_consent_url(
+    tenant: str,
+    client_id: Optional[str] = None,
+) -> dict:
+    """Generate an admin consent URL for a tenant whose policy blocks user consent.
+
+    Send this URL to the Azure AD admin of the target organization.  Once they
+    approve it, all users in that tenant can authenticate without needing
+    per-user consent.
+
+    Args:
+        tenant: The tenant domain (e.g. 'contoso.com') or tenant ID (UUID) of
+            the organization whose admin needs to approve the app.
+        client_id: Azure Application (client) ID.  Falls back to
+            AZURE_CLIENT_ID when omitted.
+    """
+    resolved_client = client_id or os.environ.get("AZURE_CLIENT_ID")
+    if not resolved_client:
+        return {"error": "client_id is required or set AZURE_CLIENT_ID in .env."}
+
+    url = (
+        f"https://login.microsoftonline.com/{tenant}/adminconsent"
+        f"?client_id={resolved_client}"
+    )
+    return {
+        "admin_consent_url": url,
+        "instructions": (
+            f"Send this URL to an Azure AD Global Administrator of '{tenant}'. "
+            "They must sign in with an admin account and click Accept. "
+            "After approval, users in that tenant can authenticate normally."
+        ),
+    }
+
+
+@mcp.tool()
+def complete_device_code_auth(account_name: str = "default") -> dict:
+    """Poll Microsoft to finish a pending Device Code authentication.
+
+    Call this after the user has completed sign-in at the URL shown by
+    start_device_code_auth.  Polls until authentication succeeds or the
+    flow expires, then saves the refresh token to .env and activates the
+    account immediately — no server restart required.
+
+    Args:
+        account_name: The same name used in start_device_code_auth.
+    """
+    # Check in-memory first; fall back to disk (cross-process / cross-session).
+    flow = _pending_device_flows.get(account_name) or _flows_load().get(account_name)
+    if not flow:
+        return {
+            "error": (
+                f"No pending authentication for account '{account_name}'. "
+                "Call start_device_code_auth first."
+            )
+        }
+
+    token_url = TOKEN_URL.format(tenant_id=flow["tenant_id"])
+    interval = flow["interval"]
+    deadline = time.monotonic() + flow["expires_in"]
+
+    while time.monotonic() < deadline:
+        time.sleep(interval)
+        resp = httpx.post(
+            token_url,
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": flow["client_id"],
+                "device_code": flow["device_code"],
+            },
+            timeout=30,
+        )
+        data = resp.json()
+
+        if "access_token" in data:
+            refresh_token = data.get("refresh_token", "")
+            _save_account_to_env(
+                account_name, flow["tenant_id"], flow["client_id"], refresh_token
+            )
+            _reload_accounts()
+            _pending_device_flows.pop(account_name, None)
+            _flows_delete(account_name)
+            return {
+                "status": "success",
+                "account": account_name,
+                "message": (
+                    f"Account '{account_name}' authenticated and saved. "
+                    "It is now available for all tools."
+                ),
+            }
+
+        error = data.get("error")
+        if error == "authorization_pending":
+            continue
+        if error == "slow_down":
+            interval += 5
+            continue
+        # Any other error (e.g. expired_token, access_denied) is terminal
+        _pending_device_flows.pop(account_name, None)
+        _flows_delete(account_name)
+        return {
+            "error": error,
+            "error_description": data.get("error_description"),
+        }
+
+    _pending_device_flows.pop(account_name, None)
+    _flows_delete(account_name)
+    return {
+        "error": "timeout",
+        "message": (
+            "The device code expired before authentication completed. "
+            "Call start_device_code_auth again to restart."
         ),
     }
 
@@ -411,5 +770,15 @@ def search_events(
     return _graph("GET", f"/users/{user_email}/events", account=account, params=params)
 
 
-if __name__ == "__main__":
+def main() -> None:
+    import sys
+    try:
+        tools = list(mcp._tool_manager._tools.keys())
+        print(f"[outlook-mcp] registered tools ({len(tools)}): {tools}", file=sys.stderr)
+    except Exception as e:
+        print(f"[outlook-mcp] could not list tools: {e}", file=sys.stderr)
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
